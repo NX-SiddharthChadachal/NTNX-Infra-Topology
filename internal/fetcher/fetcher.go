@@ -159,6 +159,7 @@ func (f *Fetcher) SetHostLogin(entityID, ip, user, pass string) {
 		}
 		f.addresses[entityID] = ip
 	}
+	f.auth[norm] = authUnknown
 	for i, src := range f.pcs {
 		if api.NormalizeHost(src.host) == norm {
 			f.pcs[i] = newPCSource(src.host, user, pass, f.insecure, f.timeout)
@@ -179,6 +180,50 @@ func (f *Fetcher) credsFor(host string) (user, pass string, ok bool) {
 		return "", "", false
 	}
 	return c.user, c.pass, true
+}
+
+func (f *Fetcher) authenticateHost(host string, verify func() error) error {
+	host = api.NormalizeHost(host)
+	if host == "" {
+		return fmt.Errorf("no API client")
+	}
+	f.credMu.Lock()
+	state := f.auth[host]
+	f.credMu.Unlock()
+	if state == authOK {
+		return nil
+	}
+	if state == authRejected {
+		return &api.APIError{StatusCode: 401, Message: "credentials rejected"}
+	}
+
+	err := verify()
+	if err == nil {
+		f.credMu.Lock()
+		f.auth[host] = authOK
+		f.credMu.Unlock()
+		return nil
+	}
+	if IsAuthErr(err) {
+		f.credMu.Lock()
+		f.auth[host] = authRejected
+		f.credMu.Unlock()
+	}
+	return err
+}
+
+func (f *Fetcher) authenticatePC(src *pcSource) error {
+	if src == nil || src.v3 == nil {
+		return fmt.Errorf("no API client")
+	}
+	return f.authenticateHost(src.host, src.v3.VerifyLogin)
+}
+
+func (f *Fetcher) authenticatePE() error {
+	if f.pe == nil {
+		return fmt.Errorf("no API client")
+	}
+	return f.authenticateHost(f.pe.Host(), f.pe.VerifyLogin)
 }
 
 // trustedHost reports whether we may send credentials to host. Only two things
@@ -480,7 +525,15 @@ func (f *Fetcher) fetchAll() (model.Inventory, *model.Cluster, string, []string)
 	seen := map[string]bool{}
 
 	for _, src := range f.pcs {
-		pc, ver, err := f.fetchPCInventory(src)
+		authErr := f.authenticatePC(src)
+		var pc model.PCNode
+		var ver string
+		var err error
+		if authErr != nil {
+			err = authErr
+		} else {
+			pc, ver, err = f.fetchPCInventory(src)
+		}
 		if err != nil {
 			slog.Warn("inventory failed", "host", src.host, "error", err)
 			errs = append(errs, src.host+": "+err.Error())
@@ -506,6 +559,10 @@ func (f *Fetcher) fetchAll() (model.Inventory, *model.Cluster, string, []string)
 		}
 		seen[key] = true
 
+		if authErr != nil {
+			inv.PCs = append(inv.PCs, pc)
+			continue
+		}
 		azs, azErr := src.v3.ListAvailabilityZones()
 		if azErr != nil {
 			slog.Debug("availability zones unavailable", "host", src.host, "error", azErr)
@@ -569,7 +626,14 @@ func (f *Fetcher) fetchAll() (model.Inventory, *model.Cluster, string, []string)
 	}
 
 	if f.pe != nil {
-		topo, err := f.pe.FetchTopology()
+		authErr := f.authenticatePE()
+		var topo *model.Cluster
+		var err error
+		if authErr != nil {
+			err = authErr
+		} else {
+			topo, err = f.pe.FetchTopology()
+		}
 		if err != nil {
 			slog.Warn("v2 PE inventory failed", "error", err)
 			errs = append(errs, "pe: "+err.Error())
@@ -664,6 +728,17 @@ func (f *Fetcher) discoverRemoteAZ(az v3client.AvailabilityZone, ip, user, pass 
 	}
 
 	remote := newPCSource(ip, user, pass, f.insecure, f.timeout)
+	if err := f.authenticatePC(remote); err != nil {
+		reach, creds, msg := classifyRemoteErr(err)
+		item.Reachable = reach
+		item.CredsOK = creds
+		item.Message = msg
+		if !reach {
+			item.Status = model.StatusDown
+		}
+		*errs = append(*errs, ip+": "+err.Error())
+		return model.PCNode{InventoryItem: item}
+	}
 	pc, _, err := f.fetchPCInventory(remote)
 	if err != nil {
 		reach, creds, msg := classifyRemoteErr(err)
